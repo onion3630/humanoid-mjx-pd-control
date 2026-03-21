@@ -1,25 +1,24 @@
 # .gitignore
 
-# Python
+# Pythonキャッシュ
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
-env/
-venv/
-.env
 
-# MuJoCo / RL Results (学習済みパラメータなどの巨大ファイル)
+# 旧世代のバックアップフォルダ（前身プロジェクト資産）
+_old/
+
+# 学習済みパラメータ（巨大バイナリ）
 *.pkg
+
+# 出力物（動画・ログ）
 *.mp4
 *.png
 *.log
 
-# WSL / OS
+# システム・エディタ関連
 .DS_Store
 Thumbs.db
-.ipynb_checkpoints/
-
-# IDE
 .vscode/
 .idea/
+.env
