@@ -1,0 +1,25 @@
+# .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.env
+
+# MuJoCo / RL Results (学習済みパラメータなどの巨大ファイル)
+*.pkg
+*.mp4
+*.png
+*.log
+
+# WSL / OS
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
