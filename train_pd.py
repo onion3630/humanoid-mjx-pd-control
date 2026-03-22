@@ -1,76 +1,102 @@
 import os
 import time
-import math
+import datetime
 import jax
+import jax.numpy as jnp
 from brax.training.agents.ppo import train as ppo
 from brax.io import model
-from pd_env import PDHumanoid
+from pd_env import PDHumanoid, KP_GAIN, KD_GAIN, UPRIGHT_WEIGHT, HEIGHT_WEIGHT, STILL_THRESHOLD, STILL_SUCCESS_STEPS
 
 # ==========================================
-# 🧠 学習ハイパーパラメータ
+# ⚙️ 学習ハイパーパラメータ
 # ==========================================
-TOTAL_TIMESTEPS = 15_000_000  # 総学習ステップ数（目標値）
-LEARNING_RATE = 1e-4           
-ENTROPY_COST = 1e-2            
-NUM_ENVS = 2048                
-BATCH_SIZE = 2048              
+TOTAL_TIMESTEPS = 300_000_000 
+NUM_ENVS = 256         
+UNROLL_LENGTH = 128    
 NUM_MINIBATCHES = 32           
-SAVE_FILE = "humanoid_pd_params.pkg" 
-
-# 評価の回数（ログ出力の回数）
-NUM_EVALS = 11
+LEARNING_RATE = 3e-4           
 # ==========================================
 
 def main():
-    # 共有ライブラリのパス設定
-    if 'CONDA_PREFIX' in os.environ:
-        os.environ['LD_LIBRARY_PATH'] = f"{os.environ['CONDA_PREFIX']}/lib:{os.getenv('LD_LIBRARY_PATH', '')}"
-
-    # --- 終了ステップ数の切り上げ計算と警告 ---
-    chunk_size = NUM_ENVS * 20 * NUM_MINIBATCHES  # 1回の最小計算ブロック (unroll_length=20)
-    steps_per_eval = math.ceil(TOTAL_TIMESTEPS / NUM_EVALS / chunk_size) * chunk_size
-    actual_steps = steps_per_eval * NUM_EVALS
+    # タイムスタンプとベースファイル名の定義
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    BASE_NAME = "humanoid_pd_params"
     
-    if actual_steps > TOTAL_TIMESTEPS:
-        print(f"\n[注意] 指定ステップ数 ({TOTAL_TIMESTEPS:,}) はGPUの計算単位に満たないため自動調整されます。")
-        print(f"       実際の最終ステップ数は約 {actual_steps:,} になる見込みです。\n")
-    # ------------------------------------------
+    # 仕様変更: ベース名を用いてモデルとログのファイル名を紐付け
+    SAVE_FILE = f"{BASE_NAME}_{ts}.pkg"
+    LOG_FILE = f"{BASE_NAME}_trainlog_{ts}.csv"
 
-    print(f"使用デバイス: {jax.devices()}")
     env = PDHumanoid(backend='mjx')
+    action_repeat = getattr(env, 'action_repeat', 4)
+
+    # 1回のログ出力で進むステップ数
+    steps_per_update = NUM_ENVS * UNROLL_LENGTH * action_repeat
+    num_evals = TOTAL_TIMESTEPS // steps_per_update
     
-    print(f"学習開始 ({actual_steps:,} steps予定)...")
+    # ログに表示し、最終的な正となるステップ数
+    actual_steps = steps_per_update * num_evals
+    
+    # Brax内部のループ仕様に合わせるための逆算（4倍オーバーランの防止）
+    brax_timesteps = actual_steps // action_repeat
+
+    print(f"\n[構成確認]")
+    print(f"       1チャンク(Update): {steps_per_update:,} steps")
+    print(f"       総チャンク数 (表示回数): {num_evals}")
+    print(f"       最終ステップ数: {actual_steps:,}")
+    print(f"       出力モデル: {SAVE_FILE}")
+    print(f"       出力ログ: {LOG_FILE}\n")
+
     start_time = time.time()
+    last_step = -1
 
-    # --- 計算負荷ゼロのリッチな進捗表示 ---
+    # CSVヘッダーにメタデータを書き込み
+    with open(LOG_FILE, 'w', encoding='utf-8') as f:
+        f.write(f"# MODEL_FILE: {SAVE_FILE}\n")
+        f.write(f"# TOTAL_TIMESTEPS: {actual_steps}\n")
+        f.write(f"# NUM_ENVS: {NUM_ENVS}\n")
+        f.write(f"# LEARNING_RATE: {LEARNING_RATE}\n")
+        f.write(f"# KP_GAIN: {KP_GAIN}, KD_GAIN: {KD_GAIN}\n")
+        f.write(f"# UPRIGHT_WEIGHT: {UPRIGHT_WEIGHT}, HEIGHT_WEIGHT: {HEIGHT_WEIGHT}\n")
+        f.write(f"# STILL_THRESHOLD: {STILL_THRESHOLD}, STILL_SUCCESS_STEPS: {STILL_SUCCESS_STEPS}\n")
+        f.write("Step,Reward,Length,Time\n")
+
     def progress(num_steps, metrics):
-        reward = metrics.get('eval/episode_reward', 0.0)
-        # 判明した正しい変数名で生存長を取得
-        length = metrics.get('eval/avg_episode_length', 0.0) 
-        elapsed = time.time() - start_time
+        nonlocal last_step
         
-        print(f"Step: {num_steps:>11,} | 報酬: {reward:>9.2f} | 生存長: {length:>6.1f} steps | 経過: {elapsed:>6.1f}s")
-    # ----------------------------------------------
+        if num_steps == last_step:
+            return
+        last_step = num_steps
 
-    # PPOによる学習の実行
-    _, params, _ = ppo.train(
+        reward = metrics.get('eval/episode_reward', 0.0)
+        length = metrics.get('eval/avg_episode_length', 0.0)
+        elapsed_time = time.time() - start_time
+
+        print(f"Step: {num_steps:<12,} | 報酬 (Reward): {reward:>10.2f} | 生存長 (Length): {length:>8.1f} | 経過 (Time): {elapsed_time:>8.1f}s")
+        
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"{num_steps},{reward:.2f},{length:.1f},{elapsed_time:.1f}\n")
+
+    print("JITコンパイルを開始します... (これには2〜5分ほどかかります)")
+    
+    make_inference_fn, params, _ = ppo.train(
         environment=env,
-        num_envs=NUM_ENVS,
-        num_timesteps=TOTAL_TIMESTEPS,
+        num_timesteps=brax_timesteps,  # 逆算した値を渡し、内部ループ回数を補正する
         episode_length=1000,
-        learning_rate=LEARNING_RATE,
-        entropy_cost=ENTROPY_COST,
-        batch_size=BATCH_SIZE,
+        num_envs=NUM_ENVS,
+        unroll_length=UNROLL_LENGTH,
         num_minibatches=NUM_MINIBATCHES,
-        unroll_length=20,
-        seed=0,
-        progress_fn=progress,
-        num_evals=NUM_EVALS
+        num_updates_per_batch=4,
+        learning_rate=LEARNING_RATE,
+        entropy_cost=1e-2,
+        discounting=0.97,
+        gae_lambda=0.95,
+        num_evals=num_evals,
+        reward_scaling=0.1,
+        progress_fn=progress
     )
 
-    # 学習済みパラメータの保存
     model.save_params(SAVE_FILE, params)
-    print(f"学習が終了しました。モデルを '{SAVE_FILE}' に保存しました。")
+    print(f"\n学習完了。パラメータを {SAVE_FILE} に保存しました。")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -1,7 +1,7 @@
 # 設計仕様書 (Design.md)
 
 **【AIアシスタントへの引き継ぎ事項】**
-本ドキュメントは、Google MuJoCo MJXおよびBraxを用いた人型ロボットの強化学習プロジェクトの仕様書です。以後のコード修正や開発を担当するAIは、本ドキュメントの「技術スタック」「JAX/MJX特有の制約」「観測・行動・報酬の定義」を熟読し、既存のアーキテクチャを破壊しないようPhase 1の実装を進めてください。
+本ドキュメントは、Google MuJoCo MJXおよびBraxを用いた人型ロボットの強化学習プロジェクトの仕様書です。以後のコード修正や開発を担当するAIは、本ドキュメントの「技術スタック」「JAX/MJX特有の制約」「観測・行動・報酬の定義」を熟読し、既存のアーキテクチャを破壊しないよう実装を進めてください。
 
 ---
 
@@ -18,73 +18,77 @@
 本環境の `step` および `reset` 関数は `jax.jit` によってコンパイルされます。以後のコード修正において、AIは以下の制約を厳守すること。
 1. **Python標準の制御構文（`if`, `for`, `while`）を使用しない**。条件分岐には必ず `jax.lax.cond` または `jax.numpy.where` を使用すること。
 2. **ミュータブルな状態変更を行わない**。配列の更新は `x = x.at[i].set(val)` の形式で行うこと。
-3. **NumPy (`np`) を直接使用しない**。計算はすべて `jax.numpy` (`jnp`) を使用すること。
+3. **辞書からのデータ取得とデフォルト値**。`getattr` や辞書の `get` を用いる際、型エラーを防ぐため必ず対象となるデータ型と合わせた初期値を指定すること。
 
 ---
 
-## 1. pd_env.py (環境定義モジュール)
-人型ロボットの物理シミュレーション環境と、関節制御（PD制御）のロジックを定義します。
+## 1. 環境定義と物理設計 (pd_env.py)
 
-### 1.1 空間定義 (Space Definitions)
-- **観測空間 (Observation Space)**: AIへの入力。
-  - 構成: 胴体のローカル座標系における速度、重心位置、各関節の角度（`qpos`）、および角速度（`qvel`）。
-  - 型: `jax.numpy.ndarray` (1次元ベクトル)
-- **行動空間 (Action Space)**: AIからの出力。
-  - 構成: 各関節の「目標角度」を指定するベクトル。
-  - 範囲: `-1.0` 〜 `1.0` (内部で `ACTION_LIMIT` 倍され、実際のラジアン角に変換される)。
+### 1.1 観測と行動 (Observation & Action)
+- **行動 (Action)**: 21次元の連続値 `[-1.0, 1.0]`。各関節の目標角度に対するスケール値として機能します。
+- **観測 (Observation)**: ロボットの各関節の角度、角速度、胴体の位置・回転（四元数）、重心位置などの物理状態。
 
 ### 1.2 制御方式と主要パラメータ
-AIが出力した目標角度に対し、以下のPD制御則を適用してトルク $\tau$ を算出します。
-$\tau = K_p (\theta_{target} - \theta_{current}) - K_d \dot{\theta}$
-
-| 変数名 | 意味 | 入力制限 / 目安 |
-| :--- | :--- | :--- |
-| `KP_GAIN` ($K_p$) | 比例ゲイン。関節を目標に引き戻すバネの強さ。 | 30.0 〜 100.0（300超は数値発散によるシミュレーション破綻を招く） |
-| `KD_GAIN` ($K_d$) | 微分ゲイン。動きの振動を抑える制動力。 | 0.5 〜 10.0（$K_p$ の10%〜20%程度） |
-| `ACTION_LIMIT` | AIが指定できる目標角度の最大範囲。 | 0.1 〜 1.0（1.0で約57度） |
-| `FALL_HEIGHT` | 転倒と判定する頭部の最低高さ。 | 0.5 〜 0.8m |
-| `FLY_HEIGHT` | 異常浮上判定（報酬ハック対策）。 | 2.0m 前後 |
+各関節に対してトルクを直接与えるのではなく、目標角度と現在角度の差分を用いた **PD制御（比例・微分制御）** を採用しています。
+- **PD制御の数式**: 
+  $\tau = K_p (\theta_{\text{target}} - \theta_{\text{current}}) - K_d \dot{\theta}_{\text{current}}$
+- **主要な制御パラメータ**:
+  - `KP_GAIN` (比例ゲイン): 60.0
+  - `KD_GAIN` (微分ゲイン): 5.0
+  - `ACTION_LIMIT`: 0.8 (目標角度の最大可動域)
+- **静止ゴール用パラメータ**:
+  - `STILL_THRESHOLD`: 0.05 (静止とみなす全関節速度のL2ノルムしきい値)
+  - `STILL_SUCCESS_STEPS`: 50.0 (ゴールとみなす静止状態の継続ステップ数)
+  - `SUCCESS_BONUS`: 500.0 (成功時に与えられるボーナス報酬)
 
 ### 1.3 現在の報酬関数 (Reward Function)
-現在（初期実装）の `step` 関数では以下の合計を報酬として返しています。
-1. **前進報酬**: `forward_reward = forward_velocity * FORWARD_WEIGHT`
-2. **生存報酬**: `healthy_reward = HEALTHY_REWARD` (転倒していない場合に付与)
-3. **制御コスト**: `ctrl_cost = sum(action^2) * CTRL_COST_WEIGHT` (減点)
-4. **ペナルティ**: 転倒または異常浮上時に `PENALTY_REWARD` (例: -50.0) を付与し、エピソードを終了(`done=True`)。
+ロボットが直立姿勢を維持し、かつ安定して静止するための報酬設計です。
+
+1. **姿勢報酬 (Upright Reward)**: 胴体のZ軸方向ベクトルの内積。直立しているほど高報酬。
+2. **高度報酬 (Height Reward)**: 目標高度（1.2m）に対するガウス関数。目標高度に近いほど高報酬。
+3. **生存報酬 (Healthy Reward)**: 転倒高度（0.7m）を下回る、または異常な浮き上がり（2.5m）を上回らない限り毎ステップ加算される。
+4. **制御コスト (Control Cost)**: 行動（出力）の二乗和によるペナルティ。無駄な動きを抑制する。
+5. **静止ボーナスと終了判定 (Still Goal & Done)**: 
+   全関節速度のL2ノルムが `0.05` 未満のステップ数をカウントし、`50` ステップ継続した場合にボーナスを加算してエピソードを成功終了とする。
 
 ---
 
-## 2. 次フェーズ (Phase 1: 姿勢維持) の開発要件
-引き継ぎ先のAIは、上記の `pd_env.py` を改修し、以下の「外乱に耐えて直立を維持する」仕様に変更してください。
+## 2. 実装済みの機能（Phase 1: 姿勢維持と静止状態の獲得）
 
-### 要件A: 報酬関数の再設計
-「前に進むこと」ではなく「その場に立ち続けること」を評価するよう報酬を変更します。
-- **削除**: 前進報酬 (`forward_reward`) を完全削除。
-- **追加 (姿勢報酬)**: 胴体（torso）のZ軸方向のベクトルが、ワールド座標のZ軸（上方向）と一致している度合い（内積など）を計算し、直立に近いほど高い報酬を与える。
-- **追加 (高さ報酬)**: 頭部の高さが特定の目標値（例: 1.5m）に近いほど高い報酬を与える。
+現在、Phase 1の開発として以下の機能が実装済みです。以後のコード改修時もこのロジックを破壊しないこと。
 
-### 要件B: ドメインランダマイゼーション (Domain Randomization) の導入
-`reset` 関数を改修し、エピソード開始時の初期状態をランダム化します。
-- **空中からの落下**: 初期高度（Z座標）を 1.0m 〜 2.0m の間でランダムに設定。
-- **初期姿勢のランダム化**: 各関節の初期角度（`qpos`）に、微小なノイズ（一様分布など）を乗算して初期化。
-  - *実装時の注意*: JAXの擬似乱数生成器 (`jax.random.split`, `jax.random.uniform`) を正しく使用し、JITコンパイルに準拠させること。
+- **Domain Randomization（初期状態のランダム化）**
+  ロボットを空中のランダムな高さから落下させ、姿勢や速度にも微小なノイズを付与しています。
+  ※【注意】MJCF（物理モデル）の崩壊を防ぐため、四元数（クォータニオン `qpos[3:7]`）には絶対にノイズを付与しないこと。
+- **JAXの型制約と状態管理（Metricsの保護）**
+  静止カウントを行う変数（`state.metrics['still_steps']`）は、JAXのコンパイル制約を満たすため、`reset` 関数で必ず `jnp.float32` 型として初期化しています。`step` 関数内でも、Pythonの `1` ではなく `jnp.array(1.0)` 等を用いて厳密な型の一致を保つように設計されています。
+- **論理和と終了フラグ（done）のキャスト**
+  転倒判定（`is_fallen`）と成功判定（`is_success`）の論理和をとる際、そのままでは `bool` 型になるため、必ず `jnp.where` を用いて `float32` の `1.0` または `0.0` にキャストしてから `done` フラグとして返却しています。
 
 ---
 
 ## 3. train_pd.py (学習実行モジュール)
-| 変数名 | 意味 | 入力制限 / 目安 |
-| :--- | :--- | :--- |
-| `TOTAL_TIMESTEPS` | 学習の総試行回数（目標値）。 | 1,310,720 の倍数を推奨 |
-| `NUM_ENVS` | GPU上の並列個体数。 | 1024 〜 4096（VRAMに依存） |
 
-**【AIへの注意点: 計算チャンクの仕様】**
-GPU効率化のため、内部で `NUM_ENVS * 20 * NUM_MINIBATCHES` （デフォルトで 1,310,720 ステップ）が最小の計算単位となります。設定値がこの倍数でない場合、実際の終了ステップ数は自動的に切り上げられます（例: 15,000,000 指定時は約 28,835,840 で終了）。進捗バーや評価ログの出力タイミングもこのチャンクに依存します。
+BraxのPPOエージェントを用いて、シミュレーション内で並列学習を行います。
+
+### 3.1 計算チャンクとステップ数の厳密な補正
+学習の進行は以下の単位で計算されます。
+- **1回の計算チャンク**: `NUM_ENVS(256) * UNROLL_LENGTH(128) * action_repeat(4)`
+- **Brax内部ループのハック**: Braxは内部で `action_repeat` を考慮せずにループ回数を計算・切り上げしてしまう仕様があります。ログに表示された「最終ステップ数」と実際の学習回数を一致させるため、`ppo.train` の `num_timesteps` 引数には「最終ステップ数 ÷ action_repeat」の逆算補正を行った数値を渡す設計になっています。
+
+### 3.2 タイムスタンプによるファイル管理とログ出力
+実行ごとに現在時刻（例: `20260322_120000`）を取得し、以下のファイルを自動生成します。
+1. **モデルパラメータ (`humanoid_pd_params_[日時].pkg`)**: 学習済みのネットワークの重み。
+2. **学習ログ (`humanoid_pd_params_trainlog_[日時].csv`)**: 実行時の各種ハイパーパラメータをヘッダーに記録し、ステップごとの報酬・生存長・経過時間を追記保存するCSVファイル。
 
 ---
 
 ## 4. viz_pd.py (視覚化モジュール)
+
 学習済みパラメータ (`.pkg`) を読み込み、`mujoco.Renderer` を用いてMP4動画を生成します。
-- **自動リセット**: 推論ループ内で `state.done` が `True` になった場合、即座に `reset` を呼び出し、シミュレーションを継続させるロジックが組み込まれています。
+
+- **引数による動的ファイル指定**: スクリプト実行時、コマンドライン引数（`sys.argv[1]`）から読み込む `.pkg` ファイルを指定する仕様です。
+- **同名動画の自動出力**: 指定された `.pkg` ファイル名から拡張子を `.mp4` に置換し、対応関係が明確な動画ファイルをカレントディレクトリに出力します。
 
 ---
 
@@ -92,38 +96,41 @@ GPU効率化のため、内部で `NUM_ENVS * 20 * NUM_MINIBATCHES` （デフォ
 
 ```mermaid
 sequenceDiagram
-    participant Train as train_pd.py (main)
-    participant Env as pd_env.py (PDHumanoid)
+    participant CLI as コマンドライン
+    participant Train as train_pd.py
+    participant Env as pd_env.py
     participant PPO as brax.ppo.train
-    participant Viz as viz_pd.py (main)
-
+    participant Viz as viz_pd.py
+    
     Note over Train, PPO: 1. 学習フェーズ
-    Train->>Env: PDHumanoid(backend='mjx') インスタンス化
-    Train->>PPO: train(environment, progress_fn, ...)
+    CLI->>Train: python train_pd.py
+    Train->>Env: PDHumanoid(backend='mjx')
+    Train->>Train: 最終ステップ数と補正値の計算
+    Train->>Train: CSVファイル作成 (パラメータヘッダー記録)
+    Train->>PPO: train(補正済みtimesteps, ...)
     
     loop 学習ループ (計算チャンク単位)
-        PPO->>Env: reset(state) : 初期状態の生成
+        PPO->>Env: reset(state)
         loop エピソード実行 (NUM_ENVS並列)
             PPO->>Env: step(state, action)
-            Env-->>PPO: next_state, reward, done
+            Env-->>PPO: next_state, reward, done, metrics
         end
-        PPO->>Train: progress(num_steps, metrics) コールバック実行
+        PPO->>Train: progress コールバック
+        Train->>Train: CSVファイルへ進捗を追記
     end
     
-    PPO-->>Train: 学習済みパラメータ (params)
-    Train->>Train: model.save_params(SAVE_FILE)
+    Train->>CLI: humanoid_pd_params_[日時].pkg 保存完了
     
-    Note over Viz, Env: 2. 視覚化フェーズ
-    Viz->>Env: PDHumanoid(backend='mjx') インスタンス化
-    Viz->>Viz: model.load_params(LOAD_FILE)
+    Note over CLI, Viz: 2. 視覚化フェーズ
+    CLI->>Viz: python viz_pd.py humanoid_pd_params_[日時].pkg
+    Viz->>Env: PDHumanoid(backend='mjx')
+    Viz->>Viz: 指定された .pkg の読み込み
     
-    loop 推論ループ (SIMULATION_STEPS)
-        Viz->>Viz: jit_inference_fn(obs) -> action 算出
-        Viz->>Env: step(state, action)
-        Env-->>Viz: next_state (done判定含む)
-        alt state.done == True
-            Viz->>Env: reset(key) : 転倒時の自動復帰
-        end
+    loop シミュレーション (SIMULATION_STEPS)
+        Viz->>Env: step 推論実行
+        Viz->>Viz: states に保存
     end
-    Viz->>Viz: mujoco.Renderer でフレーム描画・MP4保存
+    
+    Viz->>Viz: mujoco.Renderer でフレーム描画
+    Viz->>CLI: 同名の .mp4 動画ファイルを保存完了
 ```
