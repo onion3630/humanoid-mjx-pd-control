@@ -1,3 +1,4 @@
+# train_pd.py
 import os
 import time
 import datetime
@@ -5,16 +6,22 @@ import jax
 import jax.numpy as jnp
 from brax.training.agents.ppo import train as ppo
 from brax.io import model
-from pd_env import PDHumanoid, KP_GAIN, KD_GAIN, UPRIGHT_WEIGHT, HEIGHT_WEIGHT, STILL_THRESHOLD, STILL_SUCCESS_STEPS
+from pd_env import (
+    PDHumanoid, KP_GAIN, KD_GAIN, UPRIGHT_WEIGHT, HEIGHT_WEIGHT,
+    TARGET_MAX_TORQUE_TORSO, TARGET_MAX_TORQUE_LEG, TARGET_MAX_TORQUE_ARM,
+    REF_GEAR, P_ENERGY_WEIGHT, P_VELOCITY_WEIGHT,
+    CROUCH_PENALTY_WEIGHT
+)
 
 # ==========================================
 # ⚙️ 学習ハイパーパラメータ
 # ==========================================
-TOTAL_TIMESTEPS = 300_000_000 
+TOTAL_TIMESTEPS = 10_000_000 
 NUM_ENVS = 256         
 UNROLL_LENGTH = 128    
 NUM_MINIBATCHES = 32           
 LEARNING_RATE = 3e-4           
+REWARD_SCALE = 0.1
 # ==========================================
 
 def main():
@@ -43,6 +50,8 @@ def main():
     print(f"       1チャンク(Update): {steps_per_update:,} steps")
     print(f"       総チャンク数 (表示回数): {num_evals}")
     print(f"       最終ステップ数: {actual_steps:,}")
+    print(f"       トルク上限 (胴体: {TARGET_MAX_TORQUE_TORSO}, 脚部: {TARGET_MAX_TORQUE_LEG}, 腕部: {TARGET_MAX_TORQUE_ARM})")
+    print(f"       報酬スケール (REWARD_SCALE): {REWARD_SCALE}")
     print(f"       出力モデル: {SAVE_FILE}")
     print(f"       出力ログ: {LOG_FILE}\n")
 
@@ -55,9 +64,12 @@ def main():
         f.write(f"# TOTAL_TIMESTEPS: {actual_steps}\n")
         f.write(f"# NUM_ENVS: {NUM_ENVS}\n")
         f.write(f"# LEARNING_RATE: {LEARNING_RATE}\n")
+        f.write(f"# REWARD_SCALE: {REWARD_SCALE}\n")
         f.write(f"# KP_GAIN: {KP_GAIN}, KD_GAIN: {KD_GAIN}\n")
+        f.write(f"# TARGET_MAX_TORQUE (TORSO: {TARGET_MAX_TORQUE_TORSO}, LEG: {TARGET_MAX_TORQUE_LEG}, ARM: {TARGET_MAX_TORQUE_ARM}), REF_GEAR: {REF_GEAR}\n")
         f.write(f"# UPRIGHT_WEIGHT: {UPRIGHT_WEIGHT}, HEIGHT_WEIGHT: {HEIGHT_WEIGHT}\n")
-        f.write(f"# STILL_THRESHOLD: {STILL_THRESHOLD}, STILL_SUCCESS_STEPS: {STILL_SUCCESS_STEPS}\n")
+        f.write(f"# P_ENERGY_WEIGHT: {P_ENERGY_WEIGHT}, P_VELOCITY_WEIGHT: {P_VELOCITY_WEIGHT}\n")
+        f.write(f"# CROUCH_PENALTY_WEIGHT: {CROUCH_PENALTY_WEIGHT}\n")
         f.write("Step,Reward,Length,Time\n")
 
     def progress(num_steps, metrics):
@@ -71,12 +83,12 @@ def main():
         length = metrics.get('eval/avg_episode_length', 0.0)
         elapsed_time = time.time() - start_time
 
-        print(f"Step: {num_steps:<12,} | 報酬 (Reward): {reward:>10.2f} | 生存長 (Length): {length:>8.1f} | 経過 (Time): {elapsed_time:>8.1f}s")
+        print(f"Step: {num_steps:<12,} | 報酬 (Reward): {reward:>10.2f} | 生存長 (Length): {length:>8.1f} | 経過 (Time): {elapsed_time:>8.1f}s", flush=True)
         
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
             f.write(f"{num_steps},{reward:.2f},{length:.1f},{elapsed_time:.1f}\n")
 
-    print("JITコンパイルを開始します... (これには2〜5分ほどかかります)")
+    print("JITコンパイルを開始します... (これには2〜5分ほどかかります)", flush=True)
     
     make_inference_fn, params, _ = ppo.train(
         environment=env,
@@ -91,12 +103,12 @@ def main():
         discounting=0.97,
         gae_lambda=0.95,
         num_evals=num_evals,
-        reward_scaling=0.1,
+        reward_scaling=REWARD_SCALE,
         progress_fn=progress
     )
 
     model.save_params(SAVE_FILE, params)
-    print(f"\n学習完了。パラメータを {SAVE_FILE} に保存しました。")
+    print(f"\n学習完了。パラメータを {SAVE_FILE} に保存しました。", flush=True)
 
 if __name__ == "__main__":
     main()
